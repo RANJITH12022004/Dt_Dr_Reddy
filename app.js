@@ -8834,7 +8834,7 @@ async function populateRecipePrintPreview(recipe) {
   currentRecipeForPrint = Object.assign({}, recipe, { factorySettings: fs });
 }
 
-/** Build recipe print text (same layout as backend format_recipe_text / report text path). */
+/** Build product print text (same layout as backend format_recipe_text / report text path). */
 function buildRecipePrintText(recipeData, layout) {
   layout = layout || 'a4';
   var width = layout === 'thermal' ? 48 : 80;
@@ -8867,13 +8867,13 @@ function buildRecipePrintText(recipeData, layout) {
     lines.push('Tablet Disintegration Tester');
     lines.push(thin);
     lines.push(String(company));
-    lines.push('RECIPE');
+    lines.push('PRODUCT DETAILS');
   } else {
     lines.push(center('RAISE LAB EQUIPMENT'));
-    lines.push(center('Tablet Disintegration Tester - Recipe'));
+    lines.push(center('Tablet Disintegration Tester - Product'));
     lines.push(thin);
     lines.push(center(String(company)));
-    lines.push(center('RECIPE'));
+    lines.push(center('PRODUCT DETAILS'));
   }
   lines.push(thin);
   lines.push(pad('Model No', fs.modelNo || 'N/A'));
@@ -8883,7 +8883,7 @@ function buildRecipePrintText(recipeData, layout) {
   lines.push(pad('Last Validation', fs.lastValidationDate || 'N/A'));
   lines.push(pad('Next Validation', fs.nextValidationDate || 'N/A'));
   lines.push(thin);
-  lines.push(pad('Recipe Name', recipeData.name || recipeData.productName || 'N/A'));
+  lines.push(pad('Product Name', recipeData.name || recipeData.productName || 'N/A'));
   lines.push(pad('Mode', modeLabel));
   lines.push(pad('Temperature', temp));
   lines.push(pad('Media', recipeData.media || 'N/A'));
