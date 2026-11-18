@@ -2599,6 +2599,7 @@ var pendingTestBasketId = null; // basket waiting for Create Recipe params befor
 var tempSampleWindows = {1: [], 2: []}; // rolling IR samples for outlier-resistant logging
 var validationTempSampleWindow = []; // rolling samples during temp validation hold
 var pendingValidationUserStatus = null; // 'PASSED' | 'FAILED' after user confirms
+var tempValidationAwaitingConfirm = false; // hold finished; waiting for Pass/Fail before report
 var basketHoles = {1: {}, 2: {}};
 var logoTapCount = 0;
 var calibrationTimer = null;
@@ -3423,16 +3424,13 @@ function confirmModal() {
 window.validationInProgress = window.validationInProgress || false;
 
 function navigateTo(s) {
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/905604f3-2798-499f-a892-696c27f300f3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:3915',message:'navigateTo called',data:{screen:s,hasDashboard:!!document.getElementById('screen-dashboard')},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-  // #endregion agent log
   if (!s) {
     console.error('navigateTo called with empty parameter'); // Because someone will do this
     return;
   }
   
-  // Block navigation during validation (except validation screens themselves and calibration)
-  if (window.validationInProgress && !['stroke-validation','temp-validation','validate-select','validate-type-select','calibration','temp-calibration-input'].includes(s)) {
+  // Block navigation during validation (except validation screens, calibration, and report preview after save)
+  if (window.validationInProgress && !['stroke-validation','temp-validation','validate-select','validate-type-select','calibration','temp-calibration-input','report-preview','reports'].includes(s)) {
     const msg = 'Validation in progress — stop or complete validation before navigating away.';
     if (typeof showModal === 'function') {
       showModal(msg);
@@ -3576,8 +3574,11 @@ function navigateTo(s) {
   }
   // PATCH 2: Exit temperature validation screen when leaving
   if (currentScreen === 'temp-validation' && s !== 'temp-validation') {
-    console.log('[navigateTo] Leaving temp-validation screen, stopping temperature validation if running');
-    if (typeof stopValidation === 'function') {
+    // Completing validation opens report-preview — do light cleanup only.
+    // Full stopValidation() would re-init the validation screen and fight the preview.
+    var goingToReport = (s === 'report-preview' || s === 'reports');
+    console.log('[navigateTo] Leaving temp-validation screen, goingToReport=', goingToReport);
+    if (!goingToReport && typeof stopValidation === 'function') {
       try {
         stopValidation();
       } catch (e) {
@@ -3606,6 +3607,9 @@ function navigateTo(s) {
     }
     if (typeof tempValidationPreheatArmed !== 'undefined') {
       tempValidationPreheatArmed = false;
+    }
+    if (typeof tempValidationAwaitingConfirm !== 'undefined') {
+      tempValidationAwaitingConfirm = false;
     }
     if (typeof stopTempValidationTempPoll === 'function') {
       stopTempValidationTempPoll();
@@ -6109,14 +6113,17 @@ async function openReportPreview(id) {
   try {
     var reports = await StorageAdapter.get('reports') || [];
     var report = null;
+    var idStr = String(id);
     for (var i = 0; i < reports.length; i++) {
-      if (reports[i].id === id) {
+      // Loose match: storage may stringify numeric ids
+      if (reports[i].id === id || String(reports[i].id) === idStr) {
         report = reports[i];
         break;
       }
     }
     
     if (!report) {
+      console.error('[openReportPreview] Report not found for id:', id, 'reports count:', reports.length);
       if (typeof showModal === 'function') {
         showModal('Report not found');
       }
@@ -6125,6 +6132,7 @@ async function openReportPreview(id) {
     
     // Store the report metadata for printing (because we need the file path)
     currentReportMeta = report;
+    window.currentReportId = report.id;
     
     // Check report type and render accordingly
     if (report.type === 'validation') {
@@ -6133,6 +6141,8 @@ async function openReportPreview(id) {
       renderTestReport(report);
     }
     
+    // Allow preview even if a validation flag was left set
+    window.validationInProgress = false;
     if (typeof navigateTo === 'function') {
       navigateTo('report-preview');
     }
@@ -6974,7 +6984,11 @@ async function stopValidation() {
   lastTempValidationMinTemp = null;
   lastTempValidationMaxTemp = null;
   tempValidationPreheatArmed = false;
+  tempValidationAwaitingConfirm = false;
+  pendingValidationUserStatus = null;
   if (typeof stopTempValidationTempPoll === 'function') stopTempValidationTempPoll();
+  var resultModal = document.getElementById('cursor-validation-result-modal');
+  if (resultModal && resultModal.parentNode) resultModal.parentNode.removeChild(resultModal);
   
   // Update UI elements to reflect stopped state
   var statusEl = document.getElementById('validation-status');
@@ -7037,6 +7051,17 @@ async function toggleTempValidation() {
     return;
   }
   
+  // Hold finished — must confirm Pass/Fail before starting again
+  if (tempValidationAwaitingConfirm) {
+    if (typeof showToast === 'function') {
+      showToast('Confirm Pass or Fail to generate the validation report first.', 'warning');
+    }
+    if (typeof promptTempValidationResultAndComplete === 'function') {
+      promptTempValidationResultAndComplete();
+    }
+    return;
+  }
+
   // If validation is running, stop it
   if (tempValidationRunning || tempValidationInterval) {
     await stopValidation();
@@ -7109,7 +7134,13 @@ function updateTempValidationToggleButton() {
     return;
   }
   
-  if (tempValidationRunning || tempValidationInterval || (typeof tempValidationPreheatArmed !== 'undefined' && tempValidationPreheatArmed)) {
+  if (tempValidationAwaitingConfirm) {
+    toggleBtn.className = 'text-yellow-400 hover:text-yellow-300 p-3 rounded-full hover:bg-gray-700';
+    toggleIcon.setAttribute('data-lucide', 'check-circle');
+    if (window.lucide && typeof lucide.createIcons === 'function') {
+      lucide.createIcons();
+    }
+  } else if (tempValidationRunning || tempValidationInterval || (typeof tempValidationPreheatArmed !== 'undefined' && tempValidationPreheatArmed)) {
     // Validation running or preheating (armed) - show stop/cancel button (red)
     toggleBtn.className = 'text-red-400 hover:text-red-300 p-3 rounded-full hover:bg-gray-700';
     toggleIcon.setAttribute('data-lucide', 'square');
@@ -7139,7 +7170,14 @@ function updateValidationStopButton() {
     return;
   }
   
-  if (tempValidationRunning || tempValidationInterval || (typeof tempValidationPreheatArmed !== 'undefined' && tempValidationPreheatArmed)) {
+  if (tempValidationAwaitingConfirm) {
+    stopBtn.className = 'w-full bg-yellow-600 hover:bg-yellow-700 active:bg-yellow-800 text-white flex items-center justify-center gap-2 border-2 border-yellow-500 shadow-lg py-4 rounded-xl font-bold';
+    stopBtnIcon.setAttribute('data-lucide', 'check-circle');
+    stopBtnText.textContent = 'CONFIRM RESULT';
+    if (window.lucide && typeof lucide.createIcons === 'function') {
+      lucide.createIcons();
+    }
+  } else if (tempValidationRunning || tempValidationInterval || (typeof tempValidationPreheatArmed !== 'undefined' && tempValidationPreheatArmed)) {
     // Validation running or preheating (armed) - show stop/cancel button (red)
     stopBtn.className = 'w-full bg-red-600 hover:bg-red-700 active:bg-red-800 text-white flex items-center justify-center gap-2 border-2 border-red-500 shadow-lg py-4 rounded-xl font-bold';
     stopBtnIcon.setAttribute('data-lucide', 'square');
@@ -7561,17 +7599,13 @@ async function completeValidation(type) {
       // If report already exists, just navigate to it instead of creating a new one
       if (existingReport) {
         console.log('[completeValidation] Stroke validation report already exists, navigating to it:', existingReport.id);
-        // Show delete calibration button after validation completes
         setCalibrationDeleteVisible(true);
-        
-        // Navigate to the existing report
+        window.validationInProgress = false;
         if (typeof openReportPreview === 'function') {
           await openReportPreview(existingReport.id);
         } else if (typeof navigateTo === 'function') {
           navigateTo('reports');
         }
-        
-        // FIX 1: Set flag at the END after navigation
         validationCompletionInProgress = false;
         window.validationInProgress = false;
         return; // Exit early - don't create duplicate report
@@ -7698,8 +7732,12 @@ async function completeValidation(type) {
     
     // Show delete calibration button after validation completes
     setCalibrationDeleteVisible(true);
+
+    // Clear validation lock BEFORE opening preview — otherwise navigateTo('report-preview') is blocked
+    window.validationInProgress = false;
+    tempValidationAwaitingConfirm = false;
     
-    // FIX 7: Navigate to validation report preview AFTER all cleanup is done
+    // Navigate to the exact saved report preview
     if (report && typeof openReportPreview === 'function') {
       console.log('[completeValidation] Navigating to report preview for report:', report.id);
       try {
@@ -7707,23 +7745,20 @@ async function completeValidation(type) {
         console.log('[completeValidation] Successfully navigated to report preview');
       } catch (e) {
         console.error('[completeValidation] Error navigating to report preview:', e);
-        // Fallback: Navigate to reports list if openReportPreview fails
         if (typeof navigateTo === 'function') {
           navigateTo('reports');
         }
       }
     } else {
-      // Fallback: Navigate to reports if openReportPreview is not available or report is missing
       console.warn('[completeValidation] Report or openReportPreview not available, navigating to reports');
-    if (typeof showModal === 'function') {
-      showModal('Validation ' + type + ' completed and saved');
-    }
+      if (typeof showModal === 'function') {
+        showModal('Validation ' + type + ' completed and saved');
+      }
       if (typeof navigateTo === 'function') {
         navigateTo('reports');
       }
     }
     
-      // FIX 1: Set flags at the END after all async operations complete
       validationCompletionInProgress = false;
       window.validationInProgress = false;
       
@@ -7750,62 +7785,13 @@ async function completeValidation(type) {
 }
 
 async function handleTempValidationPass() {
-  var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
-  var measuredPass = lastTempValidationMaxDeviation <= lim;
-  var msg = 'Measured recommendation: ' + (measuredPass ? 'PASS' : 'FAIL') +
-    ' (max deviation \u00B1' + Number(lastTempValidationMaxDeviation || 0).toFixed(2) +
-    '\u00B0C, limit \u00B1' + lim.toFixed(1) + '\u00B0C).\n\nConfirm PASS and generate the report?';
-  if (typeof showModalConfirm === 'function') {
-    var ok = await showModalConfirm(msg);
-    if (!ok) return;
-  }
-  if (tempValidationInterval) {
-    clearInterval(tempValidationInterval);
-    tempValidationInterval = null;
-  }
-  if (tempValidationTimer) {
-    clearTimeout(tempValidationTimer);
-    tempValidationTimer = null;
-  }
-  tempValidationRunning = false;
-  tempValidationElapsedStarted = false;
-  tempValidationStartTime = null;
-  pendingValidationUserStatus = 'PASSED';
-  updateTempValidationToggleButton();
-  updateValidationStopButton();
-  setCalibrationDeleteVisible(true);
-  var buttonsContainer = document.getElementById('temp-validation-buttons');
-  if (buttonsContainer) buttonsContainer.style.display = 'none';
-  completeValidation('temp');
+  tempValidationAwaitingConfirm = true;
+  await finalizeTempValidationResult('PASSED');
 }
 
 async function handleTempValidationFail() {
-  var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
-  var measuredPass = lastTempValidationMaxDeviation <= lim;
-  var msg = 'Measured recommendation: ' + (measuredPass ? 'PASS' : 'FAIL') +
-    ' (max deviation \u00B1' + Number(lastTempValidationMaxDeviation || 0).toFixed(2) +
-    '\u00B0C, limit \u00B1' + lim.toFixed(1) + '\u00B0C).\n\nConfirm FAIL and generate the report?';
-  if (typeof showModalConfirm === 'function') {
-    var ok = await showModalConfirm(msg);
-    if (!ok) return;
-  }
-  if (tempValidationInterval) {
-    clearInterval(tempValidationInterval);
-    tempValidationInterval = null;
-  }
-  if (tempValidationTimer) {
-    clearTimeout(tempValidationTimer);
-    tempValidationTimer = null;
-  }
-  tempValidationRunning = false;
-  tempValidationElapsedStarted = false;
-  tempValidationStartTime = null;
-  pendingValidationUserStatus = 'FAILED';
-  updateTempValidationToggleButton();
-  updateValidationStopButton();
-  var buttonsContainer = document.getElementById('temp-validation-buttons');
-  if (buttonsContainer) buttonsContainer.style.display = 'none';
-  completeValidation('temp');
+  tempValidationAwaitingConfirm = true;
+  await finalizeTempValidationResult('FAILED');
 }
 
 async function performCalibration() {
@@ -11403,11 +11389,14 @@ function initializeTemperatureValidationReal() {
   if (setTempDisplayEl) setTempDisplayEl.textContent = tempValidationSetTemp.toFixed(1);
   if (measuredTempDisplayEl) measuredTempDisplayEl.textContent = '0.0';
   
-  // Hide Pass/Fail buttons initially
-  if (passBtn) passBtn.style.display = 'none';
-  if (failBtn) failBtn.style.display = 'none';
+  // Hide Pass/Fail container (do not leave individual buttons stuck at display:none)
+  var buttonsContainerInit = document.getElementById('temp-validation-buttons');
+  if (buttonsContainerInit) buttonsContainerInit.style.display = 'none';
+  if (passBtn) passBtn.style.display = '';
+  if (failBtn) failBtn.style.display = '';
   if (calibrateBtn) calibrateBtn.style.display = 'none';
   if (completeBtn) completeBtn.style.display = 'none';
+  tempValidationAwaitingConfirm = false;
   
   // Reset status - waiting for user to apply set temperature, or preheating if armed
   var statusEl = document.getElementById('validation-status');
@@ -11630,27 +11619,9 @@ function startHoldingPhase() {
         }
         
         if (elapsedSec >= durSec) {
-          clearInterval(tempValidationInterval);
-          tempValidationInterval = null;
-          tempValidationRunning = false;
-          if (tempValidationTimer) {
-            clearTimeout(tempValidationTimer);
-            tempValidationTimer = null;
+          if (typeof finishTempValidationHold === 'function') {
+            finishTempValidationHold();
           }
-          
-          var withinSpec = lastTempValidationMaxDeviation <= lim;
-          if (statusEl) {
-            statusEl.textContent = 'Complete — confirm result';
-            statusEl.style.color = withinSpec ? '#10b981' : '#ef4444';
-          }
-          if (messageEl) {
-            messageEl.textContent = 'Max deviation: \u00B1' + lastTempValidationMaxDeviation.toFixed(2) + '\u00B0C (Limit \u00B1' + lim.toFixed(1) + '\u00B0C). Recommended: ' + (withinSpec ? 'PASS' : 'FAIL') + '. Confirm Pass or Fail to generate report.';
-            messageEl.style.color = withinSpec ? '#10b981' : '#ef4444';
-          }
-          // Require user confirmation — do not auto-generate report
-          if (buttonsContainer) buttonsContainer.style.display = 'flex';
-          if (typeof updateTempValidationToggleButton === 'function') updateTempValidationToggleButton();
-          if (typeof updateValidationStopButton === 'function') updateValidationStopButton();
         }
       } catch (e) {
         console.error('[Temp Validation] Error in holding loop:', e);
@@ -11658,15 +11629,181 @@ function startHoldingPhase() {
     })();
   }, 1000);
   
+  // Safety net: if samples stalled, still end hold and prompt Pass/Fail
   tempValidationTimer = setTimeout(function() {
-    if (tempValidationInterval) {
-      clearInterval(tempValidationInterval);
-      tempValidationInterval = null;
+    if (tempValidationInterval || tempValidationRunning) {
+      console.warn('[Temp Validation] Safety timeout — forcing hold completion');
+      if (typeof finishTempValidationHold === 'function') {
+        finishTempValidationHold();
+      }
     }
   }, (durSec + 15) * 1000);
 }
 
+/** Show Pass/Fail UI + modal after 2-min hold. Report only after user choice. */
+function finishTempValidationHold() {
+  // Set flag first to prevent overlapping interval ticks from stacking modals
+  if (tempValidationAwaitingConfirm) {
+    return;
+  }
+  tempValidationAwaitingConfirm = true;
+
+  if (tempValidationInterval) {
+    clearInterval(tempValidationInterval);
+    tempValidationInterval = null;
+  }
+  if (tempValidationTimer) {
+    clearTimeout(tempValidationTimer);
+    tempValidationTimer = null;
+  }
+  tempValidationRunning = false;
+
+  var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
+  var withinSpec = lastTempValidationMaxDeviation <= lim;
+  var statusEl = document.getElementById('validation-status');
+  var messageEl = document.getElementById('validation-message');
+  var buttonsContainer = document.getElementById('temp-validation-buttons');
+  var passBtn = document.getElementById('temp-validation-pass-btn');
+  var failBtn = document.getElementById('temp-validation-fail-btn');
+
+  if (statusEl) {
+    statusEl.textContent = 'Complete — confirm result';
+    statusEl.style.color = withinSpec ? '#10b981' : '#ef4444';
+  }
+  if (messageEl) {
+    messageEl.textContent = 'Max deviation: \u00B1' + Number(lastTempValidationMaxDeviation || 0).toFixed(2) +
+      '\u00B0C (Limit \u00B1' + lim.toFixed(1) + '\u00B0C). Recommended: ' + (withinSpec ? 'PASS' : 'FAIL') +
+      '. Confirm Pass or Fail to generate report.';
+    messageEl.style.color = withinSpec ? '#10b981' : '#ef4444';
+  }
+
+  // CRITICAL: initializeTemperatureValidationReal used to set pass/fail buttons to display:none.
+  // Show both the container and the buttons themselves.
+  if (passBtn) passBtn.style.display = 'flex';
+  if (failBtn) failBtn.style.display = 'flex';
+  if (buttonsContainer) buttonsContainer.style.display = 'flex';
+
+  if (typeof updateTempValidationToggleButton === 'function') updateTempValidationToggleButton();
+  if (typeof updateValidationStopButton === 'function') updateValidationStopButton();
+
+  // Unmissable modal prompt (Pass / Fail) — then generate report
+  if (typeof promptTempValidationResultAndComplete === 'function') {
+    promptTempValidationResultAndComplete();
+  }
+}
+
+/** Modal with Pass and Fail — recommendation shown; user choice drives report status. */
+function showValidationPassFailModal(message) {
+  return new Promise(function(resolve) {
+    var existing = document.getElementById('cursor-validation-result-modal');
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+
+    var modal = document.createElement('div');
+    modal.id = 'cursor-validation-result-modal';
+    modal.className = 'modal active';
+    modal.style.cssText = 'display: flex !important; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.75); z-index: 12000; justify-content: center; align-items: center;';
+    modal.innerHTML =
+      '<div class="modal-content" style="background:#1f2937;border-radius:20px;padding:32px;max-width:640px;width:90%;border:4px solid #4b5563;box-shadow:0 8px 32px rgba(0,0,0,0.5);" onclick="event.stopPropagation();">' +
+        '<h2 style="font-size:24px;font-weight:bold;margin-bottom:16px;color:white;text-align:center;">Validation Result</h2>' +
+        '<p style="margin-bottom:28px;color:white;font-size:18px;text-align:center;white-space:pre-line;">' + message + '</p>' +
+        '<div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">' +
+          '<button id="cursor-validation-fail" class="action-btn-large bg-red-600 hover:bg-red-700 text-white" style="min-width:140px;padding:16px 24px;font-size:18px;font-weight:bold;">FAIL</button>' +
+          '<button id="cursor-validation-pass" class="action-btn-large bg-green-600 hover:bg-green-700 text-white" style="min-width:140px;padding:16px 24px;font-size:18px;font-weight:bold;">PASS</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(modal);
+
+    setTimeout(function() {
+      var passEl = document.getElementById('cursor-validation-pass');
+      var failEl = document.getElementById('cursor-validation-fail');
+      var cleanup = function() {
+        if (modal && modal.parentNode) modal.parentNode.removeChild(modal);
+      };
+      if (!passEl || !failEl) {
+        cleanup();
+        resolve(null);
+        return;
+      }
+      passEl.onclick = function(e) {
+        e.stopPropagation();
+        cleanup();
+        resolve('PASSED');
+      };
+      failEl.onclick = function(e) {
+        e.stopPropagation();
+        cleanup();
+        resolve('FAILED');
+      };
+      // Do not dismiss on backdrop — must choose Pass or Fail
+    }, 10);
+  });
+}
+
+async function promptTempValidationResultAndComplete() {
+  if (!tempValidationAwaitingConfirm && !tempValidationRunning) {
+    // Allow re-entry only when awaiting confirm
+  }
+  var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
+  var withinSpec = lastTempValidationMaxDeviation <= lim;
+  var msg = 'Holding period complete.\n\nMax deviation: \u00B1' +
+    Number(lastTempValidationMaxDeviation || 0).toFixed(2) + '\u00B0C\nLimit: \u00B1' + lim.toFixed(1) +
+    '\u00B0C\n\nRecommended: ' + (withinSpec ? 'PASS' : 'FAIL') +
+    '\n\nSelect PASS or FAIL to generate the report.';
+
+  var choice = await showValidationPassFailModal(msg);
+  if (!choice) return;
+  await finalizeTempValidationResult(choice);
+}
+
+async function finalizeTempValidationResult(status) {
+  if (status !== 'PASSED' && status !== 'FAILED') return;
+
+  if (tempValidationInterval) {
+    clearInterval(tempValidationInterval);
+    tempValidationInterval = null;
+  }
+  if (tempValidationTimer) {
+    clearTimeout(tempValidationTimer);
+    tempValidationTimer = null;
+  }
+
+  tempValidationRunning = false;
+  tempValidationElapsedStarted = false;
+  tempValidationStartTime = null;
+  pendingValidationUserStatus = status;
+
+  var buttonsContainer = document.getElementById('temp-validation-buttons');
+  if (buttonsContainer) buttonsContainer.style.display = 'none';
+  var existingModal = document.getElementById('cursor-validation-result-modal');
+  if (existingModal && existingModal.parentNode) existingModal.parentNode.removeChild(existingModal);
+
+  if (typeof setCalibrationDeleteVisible === 'function') {
+    setCalibrationDeleteVisible(true);
+  }
+
+  console.log('[Temp Validation] User confirmed', status, '- generating report');
+  try {
+    if (typeof completeValidation === 'function') {
+      await completeValidation('temp');
+    }
+    tempValidationAwaitingConfirm = false;
+  } catch (e) {
+    console.error('[Temp Validation] Report generation failed:', e);
+    tempValidationAwaitingConfirm = true;
+    if (buttonsContainer) buttonsContainer.style.display = 'flex';
+    if (typeof showToast === 'function') {
+      showToast('Report generation failed. Please confirm Pass/Fail again.', 'error');
+    }
+  }
+  if (typeof updateTempValidationToggleButton === 'function') updateTempValidationToggleButton();
+  if (typeof updateValidationStopButton === 'function') updateValidationStopButton();
+}
+
 window.startHoldingPhase = startHoldingPhase;
+window.finishTempValidationHold = finishTempValidationHold;
+window.promptTempValidationResultAndComplete = promptTempValidationResultAndComplete;
+window.finalizeTempValidationResult = finalizeTempValidationResult;
+window.showValidationPassFailModal = showValidationPassFailModal;
 
 async function startTemperatureValidation() {
   if (typeof startHoldingPhase === 'function') startHoldingPhase();
