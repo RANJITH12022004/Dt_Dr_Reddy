@@ -236,228 +236,188 @@ function stopContinuousTempPolling() {
   }
 }
 
-// Trigger test start popup when temperature reaches target (called by preheat monitor)
-async function triggerTestStartPopup(basketId) {
-  console.log('[triggerTestStartPopup] Triggering popup for basket', basketId);
-  
-  // Temps from bridge SSE (window.latestTemps)
-  var temps = window.latestTemps || null;
-  
-  // Get set temperature
-  const setTempValue = Number(setTemp[basketId] || 37.0);
-  
-  // Get current IR temperature (direct mapping)
-  var irTemp = null;
-  if (basketId === 1) {
-    irTemp = (temps && (temps.IR1 || temps.basket1)) ? Number(temps.IR1 || temps.basket1) : null;
-  } else if (basketId === 2) {
-    irTemp = (temps && (temps.IR2 || temps.basket2)) ? Number(temps.IR2 || temps.basket2) : null;
+/** Rolling-window outlier filter: average of up to 4 samples, drop spikes far from median. */
+function filterOutlierAverage(samples) {
+  if (!samples || samples.length === 0) return null;
+  var nums = [];
+  for (var i = 0; i < samples.length; i++) {
+    var n = Number(samples[i]);
+    if (!isNaN(n) && isFinite(n)) nums.push(n);
   }
-  
-  var currentTempStr = 'N/A';
-  if (irTemp !== null && !isNaN(irTemp)) {
-    currentTempStr = irTemp.toFixed(1) + '°C';
+  if (nums.length === 0) return null;
+  if (nums.length === 1) return nums[0];
+  if (nums.length === 2) return (nums[0] + nums[1]) / 2;
+  var sorted = nums.slice().sort(function(a, b) { return a - b; });
+  var mid = sorted[Math.floor(sorted.length / 2)];
+  var kept = [];
+  for (var j = 0; j < nums.length; j++) {
+    // Drop corrupt readings (e.g. 6 when peers are ~35–36)
+    if (Math.abs(nums[j] - mid) <= 5.0) kept.push(nums[j]);
   }
-  var targetTempStr = setTempValue.toFixed(1) + '°C';
-  
-  // Show confirmation popup
-  var confirmMessage = `Basket ${basketId} has reached the set temperature (${currentTempStr} / Target: ${targetTempStr}).\n Do you want to start the test?`;
-  
-  console.log('[triggerTestStartPopup] Showing confirmation popup with message:', confirmMessage);
-  
-  // Use showModalConfirm to get user confirmation (fallback to confirm if modal not available)
-  var confirmFn = window.showModalConfirm || (typeof showModalConfirm === 'function' ? showModalConfirm : null);
-  var userConfirmed = false;
-  if (confirmFn) {
-    userConfirmed = await confirmFn(confirmMessage);
-  } else {
-    userConfirmed = window.confirm ? window.confirm(confirmMessage) : confirm(confirmMessage);
-  }
-  
-  if (!userConfirmed) {
-    console.log('[triggerTestStartPopup] User cancelled test start');
-    // Reset UI state
-    var btn = document.getElementById('start' + basketId);
-    if (btn) {
-      btn.textContent = 'Start';
-      btn.style.background = '#10b981';
-      btn.disabled = false;
-    }
-    window.preheatInProgress[basketId] = false;
-    testRunning[basketId] = false;
-    
-    // Update mode button UI to re-enable mode switching
-    if (typeof updateModeButtonsUI === 'function') {
-      updateModeButtonsUI(basketId);
-    }
-    
+  if (kept.length === 0) kept = [mid];
+  var sum = 0;
+  for (var k = 0; k < kept.length; k++) sum += kept[k];
+  return sum / kept.length;
+}
+
+function pushFilteredTempSample(basketId, rawValue) {
+  if (!tempSampleWindows[basketId]) tempSampleWindows[basketId] = [];
+  tempSampleWindows[basketId].push(Number(rawValue));
+  if (tempSampleWindows[basketId].length > 4) tempSampleWindows[basketId].shift();
+  return filterOutlierAverage(tempSampleWindows[basketId]);
+}
+
+function pushFilteredValidationTemp(rawValue) {
+  validationTempSampleWindow.push(Number(rawValue));
+  if (validationTempSampleWindow.length > 4) validationTempSampleWindow.shift();
+  return filterOutlierAverage(validationTempSampleWindow);
+}
+
+/** TR received: show green Start and wait — do NOT start motor or ask to start yet. */
+function markHeaterReadyForTest(basketId) {
+  console.log('[markHeaterReadyForTest] Heater ready for basket', basketId);
+  if (!window.preheatInProgress) window.preheatInProgress = {1: false, 2: false, 3: false};
+  window.preheatInProgress[basketId] = false;
+  if (!window.preheatReady) window.preheatReady = {1: false, 2: false};
+  window.preheatReady[basketId] = true;
+  preheatReady[basketId] = true;
+
+  if (typeof preheatMonitor !== 'undefined' && preheatMonitor && preheatMonitor.stopMonitoring) {
     preheatMonitor.stopMonitoring(basketId);
-    return;
   }
-  
-  // User confirmed - proceed with test start
-  console.log('[triggerTestStartPopup] User confirmed - proceeding to START command');
-  
-  // Get button and container elements
+  if (typeof stopPreheatTempPolling === 'function') {
+    stopPreheatTempPolling(basketId);
+  }
+
+  var btn = document.getElementById('start' + basketId);
+  if (btn && !testRunning[basketId]) {
+    btn.textContent = 'Start';
+    btn.style.background = '#10b981';
+    btn.disabled = false;
+  }
+  if (typeof updateModeButtonsUI === 'function') {
+    updateModeButtonsUI(basketId);
+  }
+  if (typeof showToast === 'function') {
+    showToast('Basket ' + basketId + ' at temperature. Press Start to enter test parameters.', 'success');
+  }
+}
+
+/** Open Create Recipe to collect product/mode/temp/duration before motor start. */
+function openCreateRecipeForPendingTest(basketId) {
+  pendingTestBasketId = basketId;
+  editingRecipeId = null;
+  if (typeof navigateTo === 'function') {
+    navigateTo('create-recipe');
+  }
+}
+
+/** After Create Recipe + batch/AR: send motor START and run timer. */
+async function beginTestRun(basketId) {
+  console.log('[beginTestRun] Starting motor for basket', basketId);
+  const setTempValue = Number(setTemp[basketId] || 37.0);
   var btn = document.getElementById('start' + basketId);
   var container = document.getElementById('basket' + basketId + '-container');
-  
-  // Set testStartTime ONLY at actual test start (after confirmation)
+
   testStartTime[basketId] = Date.now();
-  
-  // Initialize timer state (similar to startTest)
+  tempSampleWindows[basketId] = [];
+
   if (!timers[basketId]) {
     timers[basketId] = {running: false, secs: 0, interval: null, tempPollInterval: null, elapsedStarted: false};
   }
-  var mode = basketModes[basketId] || 'timer';
+  var mode = basketModes[basketId] || 'manual';
   var duration = basketDurations[basketId];
   var isTimerMode = mode === 'timer';
-  
+
   if (isTimerMode && duration !== null && duration !== undefined && duration > 0) {
     timers[basketId].secs = Math.floor(duration * 60);
   } else {
     timers[basketId].secs = 0;
   }
   timers[basketId].elapsedStarted = false;
-  
-  // Clear preheat flag and enable button for STOP
-  window.preheatInProgress[basketId] = false;
-  
-  // Stop preheat monitoring (test started)
-  preheatMonitor.stopMonitoring(basketId);
-  
-  // Stop preheat temperature polling (test will have its own polling)
-  stopPreheatTempPolling(basketId);
-  
+
+  if (window.preheatInProgress) window.preheatInProgress[basketId] = false;
+  if (window.preheatReady) window.preheatReady[basketId] = false;
+  preheatReady[basketId] = false;
+  if (typeof preheatMonitor !== 'undefined' && preheatMonitor && preheatMonitor.stopMonitoring) {
+    preheatMonitor.stopMonitoring(basketId);
+  }
+  if (typeof stopPreheatTempPolling === 'function') {
+    stopPreheatTempPolling(basketId);
+  }
+
   if (btn) {
     btn.disabled = false;
     btn.textContent = 'Stop';
     btn.style.background = '#ef4444';
   }
-  
-  // Set test as running
   testRunning[basketId] = true;
-  
-  // Update mode button UI to disable mode switching during test
   if (typeof updateModeButtonsUI === 'function') {
     updateModeButtonsUI(basketId);
   }
-  
-  // Send START command to ESP32 to start motor strokes (PRIORITIZE THIS)
+
   try {
-    let startResult;
-    console.log('[triggerTestStartPopup] Sending START command for basket', basketId, 'with temp:', setTempValue);
-    
-    // Send START command based on basket ID
+    var startResult;
     if (basketId === 1) {
-      console.log('[triggerTestStartPopup] Calling sendStartB1 with temp:', setTempValue);
       startResult = await sendStartB1(setTempValue);
-      console.log('[triggerTestStartPopup] sendStartB1 returned:', startResult);
     } else if (basketId === 2) {
-      console.log('[triggerTestStartPopup] Calling sendStartB2 with temp:', setTempValue);
       startResult = await sendStartB2(setTempValue);
-      console.log('[triggerTestStartPopup] sendStartB2 returned:', startResult);
     } else if (basketId === 3) {
-      const t1 = setTemp[1] || setTempValue;
-      const t2 = setTemp[2] || setTempValue;
-      console.log('[triggerTestStartPopup] Calling sendStartB3 with t1:', t1, 't2:', t2);
+      var t1 = setTemp[1] || setTempValue;
+      var t2 = setTemp[2] || setTempValue;
       if (typeof sendStartB3 === 'function') {
         startResult = await sendStartB3(t1, t2);
-        console.log('[triggerTestStartPopup] sendStartB3 returned:', startResult);
       }
     }
-    
-    // Check if START command was successful
+
     if (startResult && startResult.error) {
-      console.error('[triggerTestStartPopup] Start command failed:', startResult.error);
-      if (typeof showToast === 'function') {
-        showToast('Failed to start motor: ' + startResult.error, 'error');
-      } else if (typeof showModal === 'function') {
-        showModal('Failed to start motor: ' + startResult.error);
-      }
-      // Reset UI state on failure
-      if (btn) {
-        btn.textContent = 'Start';
-        btn.style.background = '#10b981';
-      }
+      console.error('[beginTestRun] Start command failed:', startResult.error);
+      if (typeof showToast === 'function') showToast('Failed to start motor: ' + startResult.error, 'error');
+      if (btn) { btn.textContent = 'Start'; btn.style.background = '#10b981'; }
       testRunning[basketId] = false;
-      window.preheatInProgress[basketId] = false;
-      
-      // Update mode button UI to re-enable mode switching
-      if (typeof updateModeButtonsUI === 'function') {
-        updateModeButtonsUI(basketId);
-      }
-      
-      return;
+      if (typeof updateModeButtonsUI === 'function') updateModeButtonsUI(basketId);
+      return { error: startResult.error };
     }
-    
-    // Verify the command was actually sent (check for 'ok' or 'cmd' in response)
     if (!startResult || (!startResult.ok && !startResult.cmd)) {
-      console.error('[triggerTestStartPopup] Start command response invalid:', startResult);
-      if (typeof showToast === 'function') {
-        showToast('Motor start command failed. Please check equipment connection.', 'error');
-      }
-      if (btn) {
-        btn.textContent = 'Start';
-        btn.style.background = '#10b981';
-      }
+      console.error('[beginTestRun] Start command response invalid:', startResult);
+      if (typeof showToast === 'function') showToast('Motor start command failed. Please check equipment connection.', 'error');
+      if (btn) { btn.textContent = 'Start'; btn.style.background = '#10b981'; }
       testRunning[basketId] = false;
-      window.preheatInProgress[basketId] = false;
-      
-      // Update mode button UI to re-enable mode switching
-      if (typeof updateModeButtonsUI === 'function') {
-        updateModeButtonsUI(basketId);
-      }
-      
-      return;
+      if (typeof updateModeButtonsUI === 'function') updateModeButtonsUI(basketId);
+      return { error: 'invalid_response' };
     }
-    
-    console.log('[triggerTestStartPopup] Start command sent successfully:', startResult);
-    console.log('[triggerTestStartPopup] Motor strokes should now be running for basket', basketId);
-    
-    // Show success message
+
     if (typeof showToast === 'function') {
       showToast('Test started successfully. Motor strokes running.', 'success');
     }
   } catch (e) {
-    console.error('[triggerTestStartPopup] Failed to start motor:', e, e.stack);
+    console.error('[beginTestRun] Failed to start motor:', e, e.stack);
     if (typeof showToast === 'function') {
       showToast('Motor control failed. Please check the equipment connection and try again.', 'error');
-    } else if (typeof showModal === 'function') {
-      showModal('Motor control failed. Please check the equipment connection and try again.');
     }
-    // Reset UI state on failure
-    if (btn) {
-      btn.textContent = 'Start';
-      btn.style.background = '#10b981';
-    }
+    if (btn) { btn.textContent = 'Start'; btn.style.background = '#10b981'; }
     testRunning[basketId] = false;
-    window.preheatInProgress[basketId] = false;
-    
-    // Update mode button UI to re-enable mode switching
-    if (typeof updateModeButtonsUI === 'function') {
-      updateModeButtonsUI(basketId);
-    }
-    
-    return;
+    if (typeof updateModeButtonsUI === 'function') updateModeButtonsUI(basketId);
+    return { error: String(e) };
   }
-  
-  // Start elapsed timer (mode and duration already set above)
+
   if (typeof startElapsedTimer === 'function') {
     startElapsedTimer(basketId, mode, duration, isTimerMode);
   }
-  
-  // Add active ring to container
   if (container && !container.querySelector('.basket-active-ring')) {
     var ring = document.createElement('div');
     ring.className = 'basket-active-ring';
     container.appendChild(ring);
   }
-  
-  // Update basket states
   if (typeof updateBasketStates === 'function') {
     updateBasketStates();
   }
+  return { ok: true };
+}
+
+// Legacy name: TR path now only marks ready (no auto motor start).
+async function triggerTestStartPopup(basketId) {
+  markHeaterReadyForTest(basketId);
 }
 
 // Temperature validation: show popup when TR received for selected beaker, then start 2-min holding
@@ -621,9 +581,7 @@ document.addEventListener('DOMContentLoaded', function () {
           // If preheat is in progress for this basket, show abort confirmation
           if (window.preheatInProgress && window.preheatInProgress[basketId]) {
             console.log('[Button] Preheat in progress, showing abort confirmation for basket', basketId);
-            // Show confirmation to abort preheating (use async IIFE since onclick handler isn't async)
             (async function() {
-              // FIX: Use showModalConfirm only, remove window.confirm fallback
               var confirmed = false;
               if (typeof showModalConfirm === 'function') {
                 confirmed = await showModalConfirm(
@@ -632,15 +590,14 @@ document.addEventListener('DOMContentLoaded', function () {
               }
               
               if (confirmed) {
-                // Abort preheating and reset state for THIS basket only
                 try {
-                  // Use per-basket stop command (not global sendStopAll)
                   await sendStopForBasket(basketId);
-                  // Reset button state for this basket only
                   currentBtn.textContent = 'Start';
                   currentBtn.style.background = '#10b981';
                   currentBtn.disabled = false;
                   window.preheatInProgress[basketId] = false;
+                  if (window.preheatReady) window.preheatReady[basketId] = false;
+                  preheatReady[basketId] = false;
                   testRunning[basketId] = false;
                   heaterOn[basketId] = false;
                   if (typeof updateModeButtonsUI === 'function') {
@@ -652,7 +609,6 @@ document.addEventListener('DOMContentLoaded', function () {
                   if (typeof showToast === 'function') {
                     showToast('Preheating aborted for basket ' + basketId + '.', 'info');
                   }
-                  console.log('[Button] Preheat aborted for basket', basketId, '- other basket state unchanged');
                 } catch (e) {
                   console.error('[Button] Error aborting preheat:', e);
                   if (typeof showToast === 'function') {
@@ -665,11 +621,9 @@ document.addEventListener('DOMContentLoaded', function () {
           }
           
           if (timers[basketId].running || testRunning[basketId]) {
-            // Stop the test - send STOP command for this specific basket only
             console.log('[Button] Stop button clicked for basket', basketId);
             (async function() {
               try {
-                // FIX: Use per-basket stop command instead of sendStopAll()
                 const result = await sendStopForBasket(basketId);
                 if (result && result.error) {
                   console.error('[Button] Stop command failed:', result.error);
@@ -687,24 +641,31 @@ document.addEventListener('DOMContentLoaded', function () {
               }
             })();
             return;
-          } else {
-            // Start the test - ensure configuredBeakers is set and always call startTest
-            console.log('[Button] Start button clicked for basket', basketId);
+          }
+
+          // Temp reached: open Create Recipe for parameters, then motor starts from there
+          if ((window.preheatReady && window.preheatReady[basketId]) || preheatReady[basketId]) {
+            console.log('[Button] Preheat ready — opening Create Recipe for basket', basketId);
             configuredBeakers[basketId] = true;
-            
-            // Always use startTest function
-            if (typeof startTest === 'function') {
-              startTest(basketId).catch(function(e) {
-                console.error('[Button] startTest exception:', e);
-                if (typeof showModal === 'function') {
-                  showModal('Failed to start the test. Please check that the equipment is ready and try again.');
-                }
-              });
-            } else {
-              console.error('[Button] startTest function not available');
+            if (typeof openCreateRecipeForPendingTest === 'function') {
+              openCreateRecipeForPendingTest(basketId);
+            }
+            return;
+          }
+
+          console.log('[Button] Start button clicked for basket', basketId);
+          configuredBeakers[basketId] = true;
+          if (typeof startTest === 'function') {
+            startTest(basketId).catch(function(e) {
+              console.error('[Button] startTest exception:', e);
               if (typeof showModal === 'function') {
                 showModal('Failed to start the test. Please check that the equipment is ready and try again.');
               }
+            });
+          } else {
+            console.error('[Button] startTest function not available');
+            if (typeof showModal === 'function') {
+              showModal('Failed to start the test. Please check that the equipment is ready and try again.');
             }
           }
         };
@@ -1132,16 +1093,20 @@ function updateTempsToDOM(temps) {
              ' - IR1=' + (temps.IR1 !== undefined ? temps.IR1.toFixed(1) : '--') + 
              ', IR2=' + (temps.IR2 !== undefined ? temps.IR2.toFixed(1) : '--'));
   
-  // Record temperatures during active tests: Basket 1 -> IR1, Basket 2 -> IR2
+  // Record temperatures during active tests (4-sample outlier-resistant average)
   for (var basketId = 1; basketId <= 2; basketId++) {
     if (testRunning[basketId] && testStartTime[basketId]) {
       var tempValue = (basketId === 1) ? temps.IR1 : temps.IR2;
       if (tempValue !== null && tempValue !== undefined && typeof tempValue === 'number' && !isNaN(tempValue)) {
+        var filtered = (typeof pushFilteredTempSample === 'function')
+          ? pushFilteredTempSample(basketId, tempValue)
+          : tempValue;
+        if (filtered === null || filtered === undefined || isNaN(filtered)) continue;
         var tempRecord = {t: Date.now()};
         if (basketId === 1) {
-          tempRecord.basket1 = tempValue;
+          tempRecord.basket1 = filtered;
         } else {
-          tempRecord.basket2 = tempValue;
+          tempRecord.basket2 = filtered;
         }
         recordedTemps[basketId].push(tempRecord);
       }
@@ -2629,6 +2594,11 @@ var tempValidationInterval = null;
 var isCalibrating = false;
 var timers = {1: {running: false, secs: 0, interval: null}, 2: {running: false, secs: 0, interval: null}};
 var preheatInProgress = {1: false, 2: false, 3: false};
+var preheatReady = {1: false, 2: false}; // TR received; wait for user Start → Create Recipe → motor
+var pendingTestBasketId = null; // basket waiting for Create Recipe params before beginTestRun
+var tempSampleWindows = {1: [], 2: []}; // rolling IR samples for outlier-resistant logging
+var validationTempSampleWindow = []; // rolling samples during temp validation hold
+var pendingValidationUserStatus = null; // 'PASSED' | 'FAILED' after user confirms
 var basketHoles = {1: {}, 2: {}};
 var logoTapCount = 0;
 var calibrationTimer = null;
@@ -3896,24 +3866,50 @@ function navigateTo(s) {
         initTemperatureInputs();
       }, 150);
     }
-    // Initialize form when creating a NEW recipe (not editing) - leave fields blank
     setTimeout(function() {
-      if (editingRecipeId === null) {
+      var startTestBtn = document.getElementById('recipe-start-test-btn');
+      var pendingBasket = pendingTestBasketId;
+      if (pendingBasket) {
         var titleEl = document.getElementById('recipe-title');
-        if (titleEl) titleEl.textContent = 'Create Recipe';
+        if (titleEl) titleEl.textContent = 'Test Parameters (Basket ' + pendingBasket + ')';
         var nameEl = document.getElementById('recipe-name');
-        if (nameEl) nameEl.value = '';
+        if (nameEl && !nameEl.value) nameEl.value = basketProducts[pendingBasket] || '';
         var tempEl = document.getElementById('recipe-temp');
-        if (tempEl) tempEl.value = '';
+        if (tempEl) tempEl.value = String(Number(setTemp[pendingBasket] || 37.0).toFixed(1));
         var durationEl = document.getElementById('recipe-duration');
-        if (durationEl) durationEl.value = '';
+        if (durationEl) {
+          var dur = basketSetDurations[pendingBasket] ||
+            (basketDurations[pendingBasket] != null ? formatMinutesToHHMMSS(basketDurations[pendingBasket]) : '');
+          durationEl.value = dur || '';
+        }
         var mediaEl = document.getElementById('recipe-media');
-        if (mediaEl) mediaEl.value = '';
+        if (mediaEl && !mediaEl.value) mediaEl.value = basketMedia[pendingBasket] || '';
         var meshEl = document.getElementById('recipe-mesh');
-        if (meshEl) meshEl.value = '';
+        if (meshEl && !meshEl.value) meshEl.value = basketMesh[pendingBasket] || '';
+        var modeVal = basketModes[pendingBasket] || 'manual';
         var modeInput = document.getElementById('recipe-mode-value');
-        if (modeInput) modeInput.value = '';
+        if (modeInput) modeInput.value = modeVal;
+        if (typeof selectRecipeMode === 'function') selectRecipeMode(modeVal);
+        if (startTestBtn) startTestBtn.style.display = 'flex';
+      } else if (editingRecipeId === null) {
+        var titleEl2 = document.getElementById('recipe-title');
+        if (titleEl2) titleEl2.textContent = 'Create Recipe';
+        var nameEl2 = document.getElementById('recipe-name');
+        if (nameEl2) nameEl2.value = '';
+        var tempEl2 = document.getElementById('recipe-temp');
+        if (tempEl2) tempEl2.value = '';
+        var durationEl2 = document.getElementById('recipe-duration');
+        if (durationEl2) durationEl2.value = '';
+        var mediaEl2 = document.getElementById('recipe-media');
+        if (mediaEl2) mediaEl2.value = '';
+        var meshEl2 = document.getElementById('recipe-mesh');
+        if (meshEl2) meshEl2.value = '';
+        var modeInput2 = document.getElementById('recipe-mode-value');
+        if (modeInput2) modeInput2.value = '';
         if (typeof clearRecipeModeSelection === 'function') clearRecipeModeSelection();
+        if (startTestBtn) startTestBtn.style.display = 'none';
+      } else {
+        if (startTestBtn) startTestBtn.style.display = 'none';
       }
     }, 200);
   }
@@ -4785,6 +4781,7 @@ async function startTest(basketId) {
   // Option B: do NOT set testStartTime here.
   // It must be set only when TR1/TR2 is received and the user confirms in triggerTestStartPopup().
   recordedTemps[basketId] = []; // Clear previous temperature recordings
+  tempSampleWindows[basketId] = [];
   
   // Initialize timer state (but don't start counting yet)
   if (!timers[basketId]) {
@@ -4866,9 +4863,9 @@ async function startTest(basketId) {
     }
   }
 
-  // 2) Option B behavior:
-  // Arm preheat and wait for ESP32 TR1/TR2 event.
-  // The ONLY confirmation popup must come from triggerTestStartPopup() when TR1/TR2 is received.
+  // Arm test preheat and wait for ESP32 TR1/TR2 → markHeaterReadyForTest (no auto motor start).
+  if (window.preheatReady) window.preheatReady[basketId] = false;
+  preheatReady[basketId] = false;
   try { startPreheatTempPolling(basketId); } catch (e) {}
   try { preheatMonitor.startMonitoring(basketId, setTempValue); } catch (e) {}
   if (typeof showToast === 'function') {
@@ -4956,12 +4953,14 @@ async function stopTest(basketId) {
   }
   
   var btn = document.getElementById('start' + basketId);
-  if (!btn) return;
+  if (window.preheatReady) window.preheatReady[basketId] = false;
+  preheatReady[basketId] = false;
+  if (window.preheatInProgress) window.preheatInProgress[basketId] = false;
   
   // Stop all timers
   if (timers[basketId]) {
-  if (timers[basketId].interval) {
-    clearInterval(timers[basketId].interval);
+    if (timers[basketId].interval) {
+      clearInterval(timers[basketId].interval);
       timers[basketId].interval = null;
     }
     if (timers[basketId].tempPollInterval) {
@@ -4970,9 +4969,11 @@ async function stopTest(basketId) {
     }
   }
   
-            btn.textContent = 'Start';
-            btn.style.background = '#10b981';
-  timers[basketId].running = false;
+  if (btn) {
+    btn.textContent = 'Start';
+    btn.style.background = '#10b981';
+  }
+  if (timers[basketId]) timers[basketId].running = false;
   testRunning[basketId] = false;
   
   // Update mode button UI to re-enable mode switching after test
@@ -7616,7 +7617,12 @@ async function completeValidation(type) {
           ? capturedLastTempValidationMaxDeviation : 0;
       
       var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
-      var passed = maxDeviation <= lim;
+      var measuredPass = maxDeviation <= lim;
+      // Prefer explicit user Pass/Fail confirmation when provided
+      var statusStr = (pendingValidationUserStatus === 'PASSED' || pendingValidationUserStatus === 'FAILED')
+        ? pendingValidationUserStatus
+        : (measuredPass ? 'PASSED' : 'FAILED');
+      pendingValidationUserStatus = null;
       
       report = {
         id: Date.now(),
@@ -7633,7 +7639,8 @@ async function completeValidation(type) {
         maxTemp: maxTemp,
         maxDeviation: maxDeviation,
         duration: null,
-        status: passed ? 'PASSED' : 'FAILED',
+        status: statusStr,
+        measuredRecommendation: measuredPass ? 'PASSED' : 'FAILED',
         beaker: validationBeaker || 1,
         basket: validationBeaker || 1,
         operatorName: (currentUser && currentUser.name) || '',
@@ -7742,8 +7749,16 @@ async function completeValidation(type) {
   }
 }
 
-function handleTempValidationPass() {
-  // Stop validation timers
+async function handleTempValidationPass() {
+  var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
+  var measuredPass = lastTempValidationMaxDeviation <= lim;
+  var msg = 'Measured recommendation: ' + (measuredPass ? 'PASS' : 'FAIL') +
+    ' (max deviation \u00B1' + Number(lastTempValidationMaxDeviation || 0).toFixed(2) +
+    '\u00B0C, limit \u00B1' + lim.toFixed(1) + '\u00B0C).\n\nConfirm PASS and generate the report?';
+  if (typeof showModalConfirm === 'function') {
+    var ok = await showModalConfirm(msg);
+    if (!ok) return;
+  }
   if (tempValidationInterval) {
     clearInterval(tempValidationInterval);
     tempValidationInterval = null;
@@ -7752,27 +7767,28 @@ function handleTempValidationPass() {
     clearTimeout(tempValidationTimer);
     tempValidationTimer = null;
   }
-  
-  // Reset validation state
   tempValidationRunning = false;
   tempValidationElapsedStarted = false;
   tempValidationStartTime = null;
-  
-  // Update UI
+  pendingValidationUserStatus = 'PASSED';
   updateTempValidationToggleButton();
   updateValidationStopButton();
-  
-  // Show delete calibration button after validation completes
   setCalibrationDeleteVisible(true);
-  
-  // Save validation report (marks as PASSED)
+  var buttonsContainer = document.getElementById('temp-validation-buttons');
+  if (buttonsContainer) buttonsContainer.style.display = 'none';
   completeValidation('temp');
-  
-  // Note: completeValidation will navigate to report preview
 }
 
-function handleTempValidationFail() {
-  // Stop validation timers
+async function handleTempValidationFail() {
+  var lim = typeof VALIDATION_DEVIATION_LIMIT !== 'undefined' ? VALIDATION_DEVIATION_LIMIT : 0.5;
+  var measuredPass = lastTempValidationMaxDeviation <= lim;
+  var msg = 'Measured recommendation: ' + (measuredPass ? 'PASS' : 'FAIL') +
+    ' (max deviation \u00B1' + Number(lastTempValidationMaxDeviation || 0).toFixed(2) +
+    '\u00B0C, limit \u00B1' + lim.toFixed(1) + '\u00B0C).\n\nConfirm FAIL and generate the report?';
+  if (typeof showModalConfirm === 'function') {
+    var ok = await showModalConfirm(msg);
+    if (!ok) return;
+  }
   if (tempValidationInterval) {
     clearInterval(tempValidationInterval);
     tempValidationInterval = null;
@@ -7781,17 +7797,14 @@ function handleTempValidationFail() {
     clearTimeout(tempValidationTimer);
     tempValidationTimer = null;
   }
-  
-  // Reset validation state
   tempValidationRunning = false;
   tempValidationElapsedStarted = false;
   tempValidationStartTime = null;
-  
-  // Update UI
+  pendingValidationUserStatus = 'FAILED';
   updateTempValidationToggleButton();
   updateValidationStopButton();
-  
-  // Save FAILED report and navigate to report preview (same as pass)
+  var buttonsContainer = document.getElementById('temp-validation-buttons');
+  if (buttonsContainer) buttonsContainer.style.display = 'none';
   completeValidation('temp');
 }
 
@@ -8112,11 +8125,12 @@ async function setBasketConfig(c) {
     }
   }
 
-  basketConfig = c;
+  basketConfig = Number(c);
+  if (!isFinite(basketConfig) || basketConfig <= 0) basketConfig = 6;
 
   // Persist selected basket config
   try {
-    await safeSave('basketConfig', c);
+    await safeSave('basketConfig', basketConfig);
   } catch (e) {
     console.error('[setBasketConfig] Failed to save basketConfig:', e);
   }
@@ -8776,6 +8790,157 @@ function cancelRecipe() {
     navigateTo('recipe-list');
   }
 }
+
+function cancelCreateRecipeOrPendingTest() {
+  editingRecipeId = null;
+  if (pendingTestBasketId) {
+    // Keep heater ready; user can press Start again from dashboard
+    var bid = pendingTestBasketId;
+    pendingTestBasketId = null;
+    if (window.preheatReady) window.preheatReady[bid] = true;
+    preheatReady[bid] = true;
+    if (typeof navigateTo === 'function') navigateTo('dashboard');
+    return;
+  }
+  if (typeof navigateTo === 'function') {
+    navigateTo('recipe-list');
+  }
+}
+
+/** Validate Create Recipe fields, collect batch/AR, apply to basket, then beginTestRun. */
+async function startTestFromCreateRecipe() {
+  var basketId = pendingTestBasketId;
+  if (!basketId) {
+    if (typeof showModal === 'function') showModal('No basket waiting to start. Return to dashboard and press Start.');
+    return;
+  }
+
+  var nameEl = document.getElementById('recipe-name');
+  var name = nameEl && nameEl.value ? nameEl.value.trim() : '';
+  if (!name) {
+    if (typeof showModal === 'function') showModal('Product / recipe name is required');
+    return;
+  }
+
+  var tempEl = document.getElementById('recipe-temp');
+  var durationEl = document.getElementById('recipe-duration');
+  var mediaEl = document.getElementById('recipe-media');
+  var meshEl = document.getElementById('recipe-mesh');
+  var modeInput = document.getElementById('recipe-mode-value');
+
+  var modeVal = modeInput && modeInput.value ? modeInput.value.trim() : '';
+  if (!modeVal) {
+    if (typeof showModal === 'function') showModal('Please select mode (Manual/Timer) before starting.');
+    return;
+  }
+  var tempStr = tempEl && tempEl.value ? String(tempEl.value).trim() : '';
+  var tempNum = tempStr ? parseFloat(tempStr) : NaN;
+  if (!tempStr || isNaN(tempNum)) {
+    if (typeof showModal === 'function') showModal('Please enter a valid temperature before starting.');
+    return;
+  }
+  if (tempNum > MAX_TEMP_C) {
+    if (typeof showModal === 'function') showModal('MAX temperature is 55°C. Enter the temperature in range.');
+    return;
+  }
+
+  var media = mediaEl && mediaEl.value ? String(mediaEl.value).trim() : '';
+  if (!media) {
+    if (typeof showModal === 'function') showModal('Media is required.');
+    return;
+  }
+  if (typeof isAlphanumericOnly === 'function' && !isAlphanumericOnly(media)) {
+    if (typeof showModal === 'function') showModal('Media must be alphanumeric.');
+    return;
+  }
+
+  var mesh = meshEl && meshEl.value ? String(meshEl.value).trim() : '';
+  if (!mesh) {
+    if (typeof showModal === 'function') showModal('Mesh is required.');
+    return;
+  }
+  if (typeof isAlphanumericOnly === 'function' && !isAlphanumericOnly(mesh)) {
+    if (typeof showModal === 'function') showModal('Mesh must be alphanumeric.');
+    return;
+  }
+
+  var setDurationStr = durationEl && durationEl.value ? String(durationEl.value).trim() : '';
+  var durationMinutes = null;
+  if (modeVal === 'timer') {
+    if (!setDurationStr || !/^\d{1,2}:\d{2}:\d{2}$/.test(setDurationStr)) {
+      if (typeof showModal === 'function') showModal('Please enter a valid Set Duration (HH:MM:SS) for timer mode.');
+      return;
+    }
+    durationMinutes = parseSetDurationToMinutes(setDurationStr);
+    if (!durationMinutes || durationMinutes <= 0) {
+      if (typeof showModal === 'function') showModal('Please enter a non-zero Set Duration before starting.');
+      return;
+    }
+    var parts = setDurationStr.split(':');
+    setDurationStr = String(parseInt(parts[0], 10)).padStart(2, '0') + ':' +
+      String(parseInt(parts[1], 10)).padStart(2, '0') + ':' +
+      String(parseInt(parts[2], 10)).padStart(2, '0');
+  } else if (setDurationStr && /^\d{1,2}:\d{2}:\d{2}$/.test(setDurationStr)) {
+    durationMinutes = parseSetDurationToMinutes(setDurationStr);
+  }
+
+  var batchNumber = await showBatchNumberPrompt(name);
+  if (batchNumber === null) return;
+  var arNumber = await showArNumberPrompt(name);
+  if (arNumber === null) return;
+
+  basketProducts[basketId] = name;
+  basketBatches[basketId] = batchNumber;
+  basketARs[basketId] = arNumber;
+  basketModes[basketId] = modeVal;
+  setTemp[basketId] = tempNum;
+  basketMedia[basketId] = media;
+  basketMesh[basketId] = mesh;
+  if (durationMinutes != null && durationMinutes > 0) {
+    basketDurations[basketId] = durationMinutes;
+    basketSetDurations[basketId] = setDurationStr;
+  } else {
+    basketDurations[basketId] = null;
+    basketSetDurations[basketId] = null;
+  }
+  configuredBeakers[basketId] = true;
+
+  try {
+    await safeSave('basketModes', basketModes);
+    await safeSave('setTemp', setTemp);
+    await safeSave('basketProducts', basketProducts);
+    await safeSave('basketBatches', basketBatches);
+    await safeSave('basketARs', basketARs);
+    await safeSave('basketDurations', basketDurations);
+    await safeSave('basketSetDurations', basketSetDurations);
+    await safeSave('basketMedia', basketMedia);
+    await safeSave('basketMesh', basketMesh);
+  } catch (e) {
+    console.warn('[startTestFromCreateRecipe] Persist warning:', e);
+  }
+
+  if (typeof selectMode === 'function') selectMode(basketId, modeVal);
+  if (typeof updateDashboardTempButton === 'function') updateDashboardTempButton();
+  if (typeof updateDashboardProductNames === 'function') updateDashboardProductNames();
+
+  pendingTestBasketId = null;
+  if (typeof navigateTo === 'function') navigateTo('dashboard');
+
+  // Allow dashboard Start button / UI to settle, then start motor
+  setTimeout(function() {
+    if (typeof beginTestRun === 'function') {
+      beginTestRun(basketId).catch(function(err) {
+        console.error('[startTestFromCreateRecipe] beginTestRun failed:', err);
+      });
+    }
+  }, 150);
+}
+
+window.startTestFromCreateRecipe = startTestFromCreateRecipe;
+window.cancelCreateRecipeOrPendingTest = cancelCreateRecipeOrPendingTest;
+window.beginTestRun = beginTestRun;
+window.markHeaterReadyForTest = markHeaterReadyForTest;
+window.openCreateRecipeForPendingTest = openCreateRecipeForPendingTest;
 
 async function viewRecipe(index) {
   var r = recipes[index];
@@ -11404,6 +11569,8 @@ function startHoldingPhase() {
   lastTempValidationMaxDeviation = 0;
   lastTempValidationMinTemp = null;
   lastTempValidationMaxTemp = null;
+  validationTempSampleWindow = [];
+  pendingValidationUserStatus = null;
   window.validationInProgress = true;
   
   if (statusEl) {
@@ -11439,11 +11606,13 @@ function startHoldingPhase() {
         if (!temps || typeof temps !== 'object') return;
         var rawTemp = getBasketTemp(temps, beakerNum);
         if (rawTemp === null || isNaN(rawTemp)) return;
-        var currentTemp = Number(rawTemp);
-        // Track min/max raw temps (no calibration) for report
+        var currentTemp = (typeof pushFilteredValidationTemp === 'function')
+          ? pushFilteredValidationTemp(Number(rawTemp))
+          : Number(rawTemp);
+        if (currentTemp === null || isNaN(currentTemp)) return;
+        // Track min/max from filtered samples (rejects corrupt spikes like 6°C)
         if (lastTempValidationMinTemp === null || currentTemp < lastTempValidationMinTemp) lastTempValidationMinTemp = currentTemp;
         if (lastTempValidationMaxTemp === null || currentTemp > lastTempValidationMaxTemp) lastTempValidationMaxTemp = currentTemp;
-        // Max deviation = half range (max - min) / 2
         var maxDev = (lastTempValidationMinTemp !== null && lastTempValidationMaxTemp !== null)
           ? (lastTempValidationMaxTemp - lastTempValidationMinTemp) / 2
           : 0;
@@ -11471,19 +11640,17 @@ function startHoldingPhase() {
           
           var withinSpec = lastTempValidationMaxDeviation <= lim;
           if (statusEl) {
-            statusEl.textContent = 'Complete';
-            statusEl.style.color = '#9ca3af';
+            statusEl.textContent = 'Complete — confirm result';
+            statusEl.style.color = withinSpec ? '#10b981' : '#ef4444';
           }
           if (messageEl) {
-            messageEl.textContent = 'Max deviation: \u00B1' + lastTempValidationMaxDeviation.toFixed(2) + '\u00B0C (Limit \u00B1' + lim.toFixed(1) + '\u00B0C). ' + (withinSpec ? 'PASS' : 'FAIL');
+            messageEl.textContent = 'Max deviation: \u00B1' + lastTempValidationMaxDeviation.toFixed(2) + '\u00B0C (Limit \u00B1' + lim.toFixed(1) + '\u00B0C). Recommended: ' + (withinSpec ? 'PASS' : 'FAIL') + '. Confirm Pass or Fail to generate report.';
             messageEl.style.color = withinSpec ? '#10b981' : '#ef4444';
           }
-          
-          if (withinSpec) {
-            handleTempValidationPass();
-          } else {
-            handleTempValidationFail();
-          }
+          // Require user confirmation — do not auto-generate report
+          if (buttonsContainer) buttonsContainer.style.display = 'flex';
+          if (typeof updateTempValidationToggleButton === 'function') updateTempValidationToggleButton();
+          if (typeof updateValidationStopButton === 'function') updateValidationStopButton();
         }
       } catch (e) {
         console.error('[Temp Validation] Error in holding loop:', e);
@@ -12017,9 +12184,8 @@ function toggleHole(basket, hole) {
   if (!testRunning[basket]) return;
   
   // Prevent hole tapping in timer mode during test (only allow in manual mode)
-  var mode = basketModes[basket] || 'timer';
+  var mode = basketModes[basket] || 'manual';
   if (mode === 'timer') {
-    // In timer mode, holes should not be tappable during test
     console.log('[toggleHole] Hole tapping disabled in timer mode for basket', basket);
     return;
   }
@@ -12069,194 +12235,39 @@ function toggleHole(basket, hole) {
 function checkAllHolesComplete(basketId) {
   var container = document.getElementById('basket' + basketId + '-container');
   if (!container) return;
-  
-  // Handle single tube configuration (basketConfig === 1)
-  if (basketConfig === 1) {
-    if (basketHoles[basketId] && basketHoles[basketId][1]) {
-      // Single tube is complete
-      var btn = document.getElementById('start' + basketId);
-      if (btn && testRunning[basketId]) {
-        // Send STOP command to ESP32 when single tube completes - use per-basket stop
-        console.log('[checkAllHolesComplete] Single tube completed for basket', basketId, '- sending STOP command for basket', basketId, 'only');
-        if (typeof sendStopForBasket === 'function') {
-          sendStopForBasket(basketId).then(function(result) {
-            if (result && result.error) {
-              console.error('[checkAllHolesComplete] Failed to send STOP command for basket', basketId, ':', result.error);
-            } else {
-              console.log('[checkAllHolesComplete] STOP command sent successfully for basket', basketId, 'only');
-            }
-          }).catch(function(e) {
-            console.error('[checkAllHolesComplete] Error sending STOP command for basket', basketId, ':', e);
-          });
-        }
-        
-        if (timers[basketId].interval) {
-          clearInterval(timers[basketId].interval);
-          timers[basketId].interval = null;
-        }
-        if (timers[basketId].tempPollInterval) {
-          clearInterval(timers[basketId].tempPollInterval);
-          timers[basketId].tempPollInterval = null;
-        }
-        btn.textContent = 'Start';
-        btn.style.background = '#10b981';
-        timers[basketId].running = false;
-        testRunning[basketId] = false;
-        
-        // Ensure preheat/heater state is fully cleared when test completes for this basket
-        if (window.preheatInProgress) {
-          window.preheatInProgress[basketId] = false;
-        }
-        if (typeof heaterOn !== 'undefined') {
-          heaterOn[basketId] = false;
-        }
-        if (typeof stopPreheatTempPolling === 'function') {
-          stopPreheatTempPolling(basketId);
-        }
-        if (typeof preheatMonitor !== 'undefined' && preheatMonitor && preheatMonitor.stopMonitoring) {
-          preheatMonitor.stopMonitoring(basketId);
-        }
-        if (typeof updateHeaterControlUI === 'function') {
-          updateHeaterControlUI();
-        }
-        
-        // Update mode button UI to re-enable mode switching
-        if (typeof updateModeButtonsUI === 'function') {
-          updateModeButtonsUI(basketId);
-        }
-        
-        // DO NOT clear hole data here - saveCompletedTestReport needs it
-        // basketHoles[basketId] = {};
-        // holeCompletionTimes[basketId] = {};
-        
-        // Remove active ring
-        var ring = container.querySelector('.basket-active-ring');
-        if (ring) ring.remove();
-        
-        // IMPORTANT: Do NOT reset configuredBeakers - keep basket enabled after test
-        if (typeof updateBasketStates === 'function') {
-          updateBasketStates();
-        }
-        if (typeof saveCompletedTestReport === 'function') {
-          try {
-            saveCompletedTestReport(basketId, { aborted: false });
-          } catch(e) {
-            console.error(e);
-          }
-        }
-        if (typeof showModal === 'function') {
-          showModal('Basket ' + basketId + ' test completed - single tube finished!');
-        }
-      }
-    }
-        return;
+  if (!testRunning[basketId]) return;
+
+  // Normalize: storage may return string "6" which breaks strict === checks
+  var configNum = Number(basketConfig);
+  if (!isFinite(configNum) || configNum <= 0) configNum = 6;
+
+  var expectedHoles = (configNum === 1 || configNum === 3 || configNum === 6) ? configNum : 0;
+  if (expectedHoles <= 0) {
+    console.warn('[checkAllHolesComplete] Unexpected basketConfig:', basketConfig, '- coercing to 6');
+    expectedHoles = 6;
   }
-  
-  // Handle multi-tube configurations - use basketConfig and basketHoles for reliable check (quick test without recipe)
-  var expectedHoles = (basketConfig === 3 || basketConfig === 6) ? basketConfig : 0;
-  if (expectedHoles > 0) {
-    var completedCount = 0;
-    for (var h = 1; h <= expectedHoles; h++) {
-      if (basketHoles[basketId] && basketHoles[basketId][h]) completedCount++;
-    }
-    if (completedCount === expectedHoles) {
-      var btn = document.getElementById('start' + basketId);
-      if (btn && testRunning[basketId]) {
-        // Send STOP command to ESP32 when all tubes complete - use per-basket stop
-        console.log('[checkAllHolesComplete] All tubes completed for basket', basketId, '- sending STOP command for basket', basketId, 'only');
-        if (typeof sendStopForBasket === 'function') {
-          sendStopForBasket(basketId).then(function(result) {
-            if (result && result.error) {
-              console.error('[checkAllHolesComplete] Failed to send STOP command for basket', basketId, ':', result.error);
-            } else {
-              console.log('[checkAllHolesComplete] STOP command sent successfully for basket', basketId, 'only');
-            }
-          }).catch(function(e) {
-            console.error('[checkAllHolesComplete] Error sending STOP command for basket', basketId, ':', e);
-          });
-        }
-        
-        // Guard against missing timers (e.g. quick-test path)
-        if (timers[basketId]) {
-          if (timers[basketId].interval) {
-            clearInterval(timers[basketId].interval);
-            timers[basketId].interval = null;
-          }
-          if (timers[basketId].tempPollInterval) {
-            clearInterval(timers[basketId].tempPollInterval);
-            timers[basketId].tempPollInterval = null;
-          }
-        }
-        if (timers[basketId]) timers[basketId].running = false;
-        btn.textContent = 'Start';
-        btn.style.background = '#10b981';
-        testRunning[basketId] = false;
-      
-      // Ensure preheat/heater state is fully cleared when test completes for this basket
-      if (window.preheatInProgress) {
-        window.preheatInProgress[basketId] = false;
-      }
-      if (typeof heaterOn !== 'undefined') {
-        heaterOn[basketId] = false;
-      }
-      if (typeof stopPreheatTempPolling === 'function') {
-        stopPreheatTempPolling(basketId);
-      }
-      if (typeof preheatMonitor !== 'undefined' && preheatMonitor && preheatMonitor.stopMonitoring) {
-        preheatMonitor.stopMonitoring(basketId);
-      }
-      if (typeof updateHeaterControlUI === 'function') {
-        updateHeaterControlUI();
-      }
-      
-      // Update mode button UI to re-enable mode switching
-      if (typeof updateModeButtonsUI === 'function') {
-        updateModeButtonsUI(basketId);
-      }
-      
-      // Reset holes to hollow state (remove completed class, but keep them visible)
-      var holes = container.querySelectorAll('.basket-hole');
-      for (var i = 0; i < holes.length; i++) {
-        holes[i].classList.remove('completed');
-        // Keep holes visible - ensure they remain visible after test
-        if (configuredBeakers[basketId]) {
-          var holeNumber = i + 1;
-          if (holeNumber <= basketConfig) {
-            holes[i].style.display = 'flex';
-          }
-        }
-      }
-      
-      // DO NOT clear hole data here - saveCompletedTestReport needs it
-      // basketHoles[basketId] = {};
-      // holeCompletionTimes[basketId] = {};
-      
-      // Remove active ring
-      var ring = container.querySelector('.basket-active-ring');
-      if (ring) ring.remove();
-      
-      // Update hole visibility based on configuration (but don't hide configured holes)
-      if (typeof updateBasketHoleSelection === 'function') {
-        updateBasketHoleSelection(basketId);
-      }
-      
-      // IMPORTANT: Do NOT reset configuredBeakers - keep basket enabled after test
-      if (typeof updateBasketStates === 'function') {
-        updateBasketStates();
-      }
-      if (typeof saveCompletedTestReport === 'function') {
-        try {
-          saveCompletedTestReport(basketId, { aborted: false });
-        } catch(e) {
-          console.error(e);
-        }
+
+  var completedCount = 0;
+  for (var h = 1; h <= expectedHoles; h++) {
+    if (basketHoles[basketId] && basketHoles[basketId][h]) completedCount++;
+  }
+  if (completedCount !== expectedHoles) return;
+
+  console.log('[checkAllHolesComplete] All', expectedHoles, 'tubes completed for basket', basketId, '- stopping via stopTest');
+  (async function() {
+    try {
+      if (typeof stopTest === 'function') {
+        await stopTest(basketId, { aborted: false });
+      } else if (typeof sendStopForBasket === 'function') {
+        await sendStopForBasket(basketId);
       }
       if (typeof showModal === 'function') {
         showModal('Basket ' + basketId + ' test completed - all tubes finished!');
       }
-      }
+    } catch (e) {
+      console.error('[checkAllHolesComplete] stopTest error:', e);
     }
-  }
+  })();
 }
 
 // ========== REPORT SAVING SYSTEM ==========
@@ -12600,33 +12611,28 @@ function updateHeaterControlUI() {
       }
     }
     
-    // FIX: Update dashboard start/preheating button based on heater state
+    // Dashboard Start button: only sync from explicit test-preheat / ready flags.
+    // Do NOT arm preheatInProgress from settings heaterOn alone (that caused auto-start).
     var startBtn = document.getElementById('start' + i);
     if (startBtn) {
-      // Only update if test is not running (test running state takes precedence)
-      if (!testRunning[i] && !timers[i]?.running) {
-        if (heaterOn[i]) {
-          // Heater is ON → show Preheating button
-          startBtn.textContent = 'Preheating...';
-          startBtn.style.background = '#f59e0b'; // amber
-          startBtn.disabled = false; // Allow clicking to abort
-          // Set preheat in progress flag
-          if (!window.preheatInProgress) {
-            window.preheatInProgress = {1: false, 2: false, 3: false};
-          }
-          window.preheatInProgress[i] = true;
-        } else {
-          // Heater is OFF → show Start button
+      if (!testRunning[i] && !(timers[i] && timers[i].running)) {
+        var ready = (window.preheatReady && window.preheatReady[i]) || preheatReady[i];
+        var preheating = window.preheatInProgress && window.preheatInProgress[i];
+        if (ready) {
           startBtn.textContent = 'Start';
-          startBtn.style.background = '#10b981'; // green
+          startBtn.style.background = '#10b981';
           startBtn.disabled = false;
-          // Clear preheat in progress flag
-          if (window.preheatInProgress) {
-            window.preheatInProgress[i] = false;
-          }
+        } else if (preheating) {
+          startBtn.textContent = 'Preheating...';
+          startBtn.style.background = '#f59e0b';
+          startBtn.disabled = false;
+        } else if (!heaterOn[i]) {
+          startBtn.textContent = 'Start';
+          startBtn.style.background = '#10b981';
+          startBtn.disabled = false;
         }
+        // heaterOn without test-preheat: leave button as-is (settings-only heat)
       }
-      // If test is running, don't change the button (it should show "Stop")
     }
   }
 }
@@ -13353,10 +13359,10 @@ async function updateFactorySettingsDisplays() {
       
       // Load other saved settings
       var savedBasketConfig = await StorageAdapter.get('basketConfig');
-      if (savedBasketConfig) {
-        basketConfig = savedBasketConfig;
+      if (savedBasketConfig != null && savedBasketConfig !== '') {
+        basketConfig = Number(savedBasketConfig);
+        if (!isFinite(basketConfig) || basketConfig <= 0) basketConfig = 6;
       } else {
-        // Default to 6 basket configuration if not set
         basketConfig = 6;
         await safeSave('basketConfig', basketConfig);
       }

@@ -1178,7 +1178,7 @@
 <div class="screen main-content" id="screen-create-recipe">
     <div class="header-bar">
         <div class="flex items-center gap-4">
-            <button class="text-white hover:text-blue-400 p-3 rounded-full hover:bg-gray-700" onclick="editingRecipeId = null; navigateTo('recipe-list');">
+            <button class="text-white hover:text-blue-400 p-3 rounded-full hover:bg-gray-700" onclick="cancelCreateRecipeOrPendingTest()">
                 <i class="w-8 h-8" data-lucide="arrow-left"></i>
             </button>
             <h1 id="recipe-title">Create Recipe</h1>
@@ -1229,6 +1229,10 @@
                 </div>
             </div>
             <div class="flex gap-4 pt-4">
+                <button type="button" id="recipe-start-test-btn" class="w-full action-btn-large bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white flex items-center justify-center gap-3 border-4 border-blue-700" onclick="startTestFromCreateRecipe()" style="display: none;">
+                    <i class="w-8 h-8" data-lucide="play"></i>
+                    <span>START TEST</span>
+                </button>
                 <button type="button" class="w-full action-btn-large bg-green-600 hover:bg-green-700 active:bg-green-800 text-white flex items-center justify-center gap-3 border-4 border-green-700" onclick="saveRecipe()">
                     <i class="w-8 h-8" data-lucide="save"></i>
                     <span>SAVE</span>
