@@ -1956,7 +1956,7 @@ def _build_preview_like_html(report_row: dict) -> str:
         f"<p><strong>Operator Name:</strong> {operator}</p>"
         f"<p><strong>Employee ID:</strong> {employee}</p>"
         "<p><strong>Remarks:</strong></p>"
-        "<p><strong>Approved By:</strong></p>"
+        "<p><strong>Reviewed By:</strong></p>"
         "</div></body></html>"
     )
 

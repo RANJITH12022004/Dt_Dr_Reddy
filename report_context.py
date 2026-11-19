@@ -6,6 +6,7 @@ Reads from storage (reports.json, factorySettings.json), computes last/next
 validation dates, and provides filtered reports list. Used by bridge.py.
 """
 
+import calendar
 import json
 from datetime import datetime
 from pathlib import Path
@@ -25,12 +26,21 @@ def _parse_date(date_str) -> Optional[datetime]:
     return None
 
 
+def _add_months(d: datetime, months: int) -> datetime:
+    """Add calendar months, clamping day to the target month length."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return d.replace(year=year, month=month, day=day)
+
+
 def _compute_next_validation_date(last_date_str: str) -> str:
-    """Compute next validation date (last + 1 year). Returns DD-MM-YYYY or ''."""
+    """Compute next validation date (last + 3 months). Returns DD-MM-YYYY or ''."""
     d = _parse_date(last_date_str)
     if d is None:
         return ""
-    d = d.replace(year=d.year + 1)
+    d = _add_months(d, 3)
     return d.strftime("%d-%m-%Y")
 
 

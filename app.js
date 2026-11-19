@@ -6199,8 +6199,13 @@ function renderValidationReport(report) {
     if (serialEl) serialEl.textContent = ctx.serialNo || '';
     if (locEl) locEl.textContent = ctx.location || '';
     if (instrEl) instrEl.textContent = ctx.instrumentId || '';
-    if (lastValEl) lastValEl.textContent = ctx.lastValidationDate || '';
-    if (nextValEl) nextValEl.textContent = ctx.nextValidationDate || '';
+    // Prefer dates stored on this validation report (next due = +3 months)
+    if (lastValEl) {
+      lastValEl.textContent = report.lastValidationDate || ctx.lastValidationDate || '';
+    }
+    if (nextValEl) {
+      nextValEl.textContent = report.nextValidationDate || report.nextValidationDue || ctx.nextValidationDate || '';
+    }
   })();
   
   // Hide product info sections (not used in validation)
@@ -7684,6 +7689,23 @@ async function completeValidation(type) {
     }
     
     if (report) {
+      // Next validation due is always 3 months from this validation
+      var lastDtForDue = report.createdAt ? new Date(String(report.createdAt).replace('Z', '+00:00')) : null;
+      if (lastDtForDue && !isNaN(lastDtForDue.getTime())) {
+        var nextDtForDue = new Date(lastDtForDue.getTime());
+        nextDtForDue.setMonth(nextDtForDue.getMonth() + 3);
+        function _fmtValDt(d) {
+          return String(d.getDate()).padStart(2, '0') + '-' +
+            String(d.getMonth() + 1).padStart(2, '0') + '-' +
+            String(d.getFullYear()) + ' ' +
+            String(d.getHours()).padStart(2, '0') + ':' +
+            String(d.getMinutes()).padStart(2, '0');
+        }
+        report.lastValidationDate = _fmtValDt(lastDtForDue);
+        report.nextValidationDate = _fmtValDt(nextDtForDue);
+        report.nextValidationDue = report.nextValidationDate;
+      }
+
       await saveReportRecord(report);
       
       // Generate PDF from HTML after saving the validation report
@@ -7700,26 +7722,12 @@ async function completeValidation(type) {
         console.warn('[completeValidation] saveReportPdfFromHtml function not available');
       }
       
-      // Update lastValidationDate and nextValidationDate (1 year apart) in factory settings
+      // Update lastValidationDate and nextValidationDate (3 months apart) in factory settings
       try {
         const factorySettings = await StorageAdapter.get('factorySettings') || {};
-        var lastDt = report.createdAt ? new Date(report.createdAt.replace('Z', '+00:00')) : null;
-        if (lastDt && !isNaN(lastDt.getTime())) {
-          // Store date + time (HH:MM) so UI reflects the validation moment.
-          factorySettings.lastValidationDate =
-            String(lastDt.getDate()).padStart(2, '0') + '-' +
-            String(lastDt.getMonth() + 1).padStart(2, '0') + '-' +
-            String(lastDt.getFullYear()) + ' ' +
-            String(lastDt.getHours()).padStart(2, '0') + ':' +
-            String(lastDt.getMinutes()).padStart(2, '0');
-          var nextDt = new Date(lastDt);
-          nextDt.setFullYear(nextDt.getFullYear() + 1);
-          factorySettings.nextValidationDate =
-            String(nextDt.getDate()).padStart(2, '0') + '-' +
-            String(nextDt.getMonth() + 1).padStart(2, '0') + '-' +
-            String(nextDt.getFullYear()) + ' ' +
-            String(nextDt.getHours()).padStart(2, '0') + ':' +
-            String(nextDt.getMinutes()).padStart(2, '0');
+        if (report.lastValidationDate && report.nextValidationDate) {
+          factorySettings.lastValidationDate = report.lastValidationDate;
+          factorySettings.nextValidationDate = report.nextValidationDate;
         } else {
           factorySettings.lastValidationDate = report.createdAt || '';
           factorySettings.nextValidationDate = '';

@@ -214,7 +214,7 @@ def generate_text_report(report_data, txt_path, layout='a4'):
                 f.write(f"Employee ID         : {operator_id}\n")
                 f.write(f"Remarks:\n\n")
                 f.write(thin_line)
-                f.write(f"Approved By:\n")
+                f.write(f"Reviewed By:\n")
                 f.write(line)
             else:
                 tested_basket = report_data.get('basket') or 1
@@ -362,7 +362,7 @@ def generate_text_report(report_data, txt_path, layout='a4'):
                 f.write(f"Employee ID           : {operator_id}\n\n")
                 f.write(f"Remarks:\n\n")
                 f.write(thin_line)
-                f.write(f"Approved By:\n")
+                f.write(f"Reviewed By:\n")
                 f.write(line)
         _logger.info("[TEXT REPORT] Generated text report (%s layout): %s", layout, txt_path)
     except Exception as e:
